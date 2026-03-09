@@ -3,7 +3,7 @@
  * Plugin Name: Sermon Manager Lite Audit
  * Plugin URI: https://stronganchortech.com
  * Description: Audit companion for legacy Sermon Manager sites. Generates a copy/pasteable report showing how the site is currently using Sermon Manager so a future Sermon Manager Lite replacement can be built safely.
- * Version: 0.1.0
+ * Version: 0.1.1
  * Author: Strong Anchor Tech
  * Author URI: https://stronganchortech.com
  * License: GPLv2 or later
@@ -12,6 +12,38 @@
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
+}
+
+require_once plugin_dir_path( __FILE__ ) . 'vendor/plugin-update-checker/plugin-update-checker.php';
+
+use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
+
+function smla_should_boot_update_checker() {
+	$should_boot = ! ( defined( 'SMLA_DISABLE_UPDATE_CHECKER' ) && SMLA_DISABLE_UPDATE_CHECKER );
+
+	return (bool) apply_filters( 'smla_should_boot_update_checker', $should_boot );
+}
+
+function smla_get_update_branch() {
+	$branch = defined( 'SMLA_UPDATE_BRANCH' ) ? trim( (string) SMLA_UPDATE_BRANCH ) : 'main';
+
+	if ( '' === $branch ) {
+		$branch = 'main';
+	}
+
+	return (string) apply_filters( 'smla_update_branch', $branch );
+}
+
+$smla_update_checker = null;
+
+if ( smla_should_boot_update_checker() ) {
+	$smla_update_checker = PucFactory::buildUpdateChecker(
+		'https://github.com/stronganchor/sermon-manager-lite',
+		__FILE__,
+		'sermon-manager-lite'
+	);
+
+	$smla_update_checker->setBranch( smla_get_update_branch() );
 }
 
 if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
