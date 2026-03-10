@@ -3,7 +3,7 @@
  * Plugin Name: Sermon Manager Lite
  * Plugin URI: https://stronganchortech.com
  * Description: Lightweight wpfc-compatible replacement for Sermon Manager for WordPress. Preserves legacy sermon data, URLs, core front-end output, and essential shortcodes.
- * Version: 0.1.3
+ * Version: 0.1.4
  * Author: Strong Anchor Tech
  * Author URI: https://stronganchortech.com
  * License: GPLv2 or later
@@ -110,6 +110,16 @@ if ( ! class_exists( 'SML_Plugin' ) ) {
 		 */
 		private $archive_filters_rendered = false;
 
+		/**
+		 * @var bool
+		 */
+		private $single_sermon_buffer_started = false;
+
+		/**
+		 * @var int
+		 */
+		private $single_sermon_buffer_post_id = 0;
+
 		public function __construct() {
 			$this->legacy_plugin_active = $this->is_legacy_plugin_active();
 
@@ -124,6 +134,7 @@ if ( ! class_exists( 'SML_Plugin' ) ) {
 			add_action( 'add_meta_boxes', array( $this, 'register_meta_boxes' ) );
 			add_action( 'save_post_wpfc_sermon', array( $this, 'save_sermon_meta' ) );
 
+			add_action( 'template_redirect', array( $this, 'maybe_buffer_single_sermon_output' ), 0 );
 			add_action( 'pre_get_posts', array( $this, 'adjust_sermon_queries' ) );
 			add_action( 'loop_start', array( $this, 'maybe_render_archive_filters' ) );
 			add_action( 'loop_no_results', array( $this, 'maybe_render_archive_filters' ) );
@@ -488,6 +499,55 @@ if ( ! class_exists( 'SML_Plugin' ) ) {
 			echo $markup; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 		}
 
+		public function maybe_buffer_single_sermon_output() {
+			if ( is_admin() || $this->single_sermon_buffer_started || ! is_singular( 'wpfc_sermon' ) ) {
+				return;
+			}
+
+			$post_id = (int) get_queried_object_id();
+			if ( $post_id <= 0 ) {
+				return;
+			}
+
+			$this->single_sermon_buffer_started = true;
+			$this->single_sermon_buffer_post_id = $post_id;
+
+			ob_start( array( $this, 'inject_single_sermon_title_if_missing' ) );
+		}
+
+		public function inject_single_sermon_title_if_missing( $html ) {
+			if ( ! is_string( $html ) || '' === $html ) {
+				return $html;
+			}
+
+			$post_id = $this->single_sermon_buffer_post_id;
+			if ( $post_id <= 0 || 'wpfc_sermon' !== get_post_type( $post_id ) ) {
+				return $html;
+			}
+
+			if ( false === strpos( $html, 'sml-sermon-single-wrap' ) || false !== strpos( $html, 'sml-sermon-single-title' ) ) {
+				return $html;
+			}
+
+			if ( ! $this->should_inject_single_sermon_title( $html, $post_id ) ) {
+				return $html;
+			}
+
+			$title_markup = $this->render_single_sermon_title( $post_id );
+			if ( '' === $title_markup ) {
+				return $html;
+			}
+
+			$needle   = '<div class="sml-sermon-single-wrap">';
+			$position = strpos( $html, $needle );
+
+			if ( false === $position ) {
+				return $html;
+			}
+
+			return substr_replace( $html, $needle . $title_markup, $position, strlen( $needle ) );
+		}
+
 		public function filter_sermon_content( $content ) {
 			if ( is_admin() ) {
 				return $content;
@@ -527,6 +587,94 @@ if ( ! class_exists( 'SML_Plugin' ) ) {
 			$wrapped .= '</div>';
 
 			return $wrapped;
+		}
+
+		private function should_inject_single_sermon_title( $html, $post_id ) {
+			$should_inject = apply_filters( 'sml_should_inject_single_sermon_title', null, $post_id, $html );
+			if ( is_bool( $should_inject ) ) {
+				return $should_inject;
+			}
+
+			$title = $this->normalize_title_text( get_the_title( $post_id ) );
+			if ( '' === $title ) {
+				return false;
+			}
+
+			if ( ! class_exists( 'DOMDocument' ) || ! class_exists( 'DOMXPath' ) ) {
+				return ! $this->html_contains_single_sermon_title_marker( $html, $title );
+			}
+
+			$dom            = new DOMDocument();
+			$previous_state = libxml_use_internal_errors( true );
+			$loaded         = $dom->loadHTML( '<?xml encoding="utf-8" ?>' . $html );
+
+			libxml_clear_errors();
+			libxml_use_internal_errors( $previous_state );
+
+			if ( ! $loaded ) {
+				return ! $this->html_contains_single_sermon_title_marker( $html, $title );
+			}
+
+			$xpath = new DOMXPath( $dom );
+			$nodes = $xpath->query(
+				'//*[ancestor::body][self::h1 or self::h2 or self::h3 or self::h4 or self::h5 or self::h6 or contains(concat(" ", normalize-space(@class), " "), " entry-title ") or contains(concat(" ", normalize-space(@class), " "), " post-title ") or contains(concat(" ", normalize-space(@class), " "), " page-title ") or contains(concat(" ", normalize-space(@class), " "), " elementor-heading-title ") or @itemprop="headline"]'
+			);
+
+			if ( false === $nodes ) {
+				return ! $this->html_contains_single_sermon_title_marker( $html, $title );
+			}
+
+			foreach ( $nodes as $node ) {
+				$text = $this->normalize_title_text( $node->textContent );
+				if ( '' !== $text && false !== strpos( $text, $title ) ) {
+					return false;
+				}
+			}
+
+			return true;
+		}
+
+		private function render_single_sermon_title( $post_id ) {
+			$title = trim( wp_strip_all_tags( get_the_title( $post_id ) ) );
+			if ( '' === $title ) {
+				$title = __( 'Untitled Sermon', 'sermon-manager-lite' );
+			}
+
+			return '<header class="sml-sermon-single-header"><h1 class="sml-sermon-single-title">' . esc_html( $title ) . '</h1></header>';
+		}
+
+		private function html_contains_single_sermon_title_marker( $html, $title ) {
+			$patterns = array(
+				'/<h[1-6][^>]*>.*?<\/h[1-6]>/is',
+				'/<(?:div|span|p)[^>]*class=["\'][^"\']*(?:entry-title|post-title|page-title|elementor-heading-title)[^"\']*["\'][^>]*>.*?<\/(?:div|span|p)>/is',
+				'/<(?:div|span|p)[^>]*itemprop=["\']headline["\'][^>]*>.*?<\/(?:div|span|p)>/is',
+			);
+
+			foreach ( $patterns as $pattern ) {
+				if ( ! preg_match_all( $pattern, $html, $matches ) ) {
+					continue;
+				}
+
+				foreach ( $matches[0] as $match ) {
+					$text = $this->normalize_title_text( $match );
+					if ( '' !== $text && false !== strpos( $text, $title ) ) {
+						return true;
+					}
+				}
+			}
+
+			return false;
+		}
+
+		private function normalize_title_text( $value ) {
+			$value = html_entity_decode( wp_strip_all_tags( (string) $value ), ENT_QUOTES, 'UTF-8' );
+			$value = trim( preg_replace( '/\s+/u', ' ', $value ) );
+
+			if ( function_exists( 'mb_strtolower' ) ) {
+				return mb_strtolower( $value, 'UTF-8' );
+			}
+
+			return strtolower( $value );
 		}
 
 		private function render_single_sermon_header( $post_id ) {
@@ -668,6 +816,8 @@ if ( ! class_exists( 'SML_Plugin' ) ) {
 
 		public function enqueue_frontend_styles() {
 			$css = '
+			.sml-sermon-single-header{margin:0 0 1rem}
+			.sml-sermon-single-title{margin:0;line-height:1.15}
 			.sml-sermon-meta{margin:0 0 1.25rem;padding:1rem;border:1px solid #ddd;border-radius:8px;background:#fafafa}
 			.sml-sermon-meta-item + .sml-sermon-meta-item{margin-top:.35rem}
 			.sml-sermon-media{margin:0 0 1.25rem}
