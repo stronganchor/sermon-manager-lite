@@ -1,13 +1,13 @@
 <?php
 /**
- * Plugin Name: Sermon Manager Lite Audit
+ * Plugin Name: Sermon Manager Lite
  * Plugin URI: https://stronganchortech.com
- * Description: Audit companion for legacy Sermon Manager sites. Generates a copy/pasteable report showing how the site is currently using Sermon Manager so a future Sermon Manager Lite replacement can be built safely.
- * Version: 0.1.1
+ * Description: Lightweight wpfc-compatible replacement for Sermon Manager for WordPress. Preserves legacy sermon data, URLs, core front-end output, and essential shortcodes.
+ * Version: 0.1.2
  * Author: Strong Anchor Tech
  * Author URI: https://stronganchortech.com
  * License: GPLv2 or later
- * Text Domain: sermon-manager-lite-audit
+ * Text Domain: sermon-manager-lite
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -18,43 +18,47 @@ require_once plugin_dir_path( __FILE__ ) . 'vendor/plugin-update-checker/plugin-
 
 use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
 
-function smla_should_boot_update_checker() {
-	$should_boot = ! ( defined( 'SMLA_DISABLE_UPDATE_CHECKER' ) && SMLA_DISABLE_UPDATE_CHECKER );
+define( 'SML_PLUGIN_FILE', __FILE__ );
+define( 'SML_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
+define( 'SML_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 
-	return (bool) apply_filters( 'smla_should_boot_update_checker', $should_boot );
+function sml_should_boot_update_checker() {
+	$should_boot = ! ( defined( 'SML_DISABLE_UPDATE_CHECKER' ) && SML_DISABLE_UPDATE_CHECKER );
+
+	return (bool) apply_filters( 'sml_should_boot_update_checker', $should_boot );
 }
 
-function smla_get_update_branch() {
-	$branch = defined( 'SMLA_UPDATE_BRANCH' ) ? trim( (string) SMLA_UPDATE_BRANCH ) : 'main';
+function sml_get_update_branch() {
+	$branch = defined( 'SML_UPDATE_BRANCH' ) ? trim( (string) SML_UPDATE_BRANCH ) : 'main';
 
 	if ( '' === $branch ) {
 		$branch = 'main';
 	}
 
-	return (string) apply_filters( 'smla_update_branch', $branch );
+	return (string) apply_filters( 'sml_update_branch', $branch );
 }
 
-$smla_update_checker = null;
+$sml_update_checker = null;
 
-if ( smla_should_boot_update_checker() ) {
-	$smla_update_checker = PucFactory::buildUpdateChecker(
+if ( sml_should_boot_update_checker() ) {
+	$sml_update_checker = PucFactory::buildUpdateChecker(
 		'https://github.com/stronganchor/sermon-manager-lite',
 		__FILE__,
 		'sermon-manager-lite'
 	);
 
-	$smla_update_checker->setBranch( smla_get_update_branch() );
+	$sml_update_checker->setBranch( sml_get_update_branch() );
 }
 
-if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
+if ( ! class_exists( 'SML_Plugin' ) ) {
 
-	final class SMLA_Audit_Plugin {
+	final class SML_Plugin {
 
-		const VERSION = '0.1.0';
+		const VERSION = '0.2.0';
+		const NONCE_ACTION = 'sml_save_sermon_meta';
+		const NONCE_NAME   = '_sml_sermon_meta_nonce';
 
 		/**
-		 * Known Sermon Manager shortcodes gathered from public plugin docs plus one newer shortcode.
-		 *
 		 * @var string[]
 		 */
 		private $known_shortcodes = array(
@@ -68,8 +72,6 @@ if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
 		);
 
 		/**
-		 * Known Sermon Manager taxonomies.
-		 *
 		 * @var string[]
 		 */
 		private $known_taxonomies = array(
@@ -81,11 +83,9 @@ if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
 		);
 
 		/**
-		 * Known/likely sermon meta keys from legacy usage.
-		 *
 		 * @var string[]
 		 */
-		private $known_meta_keys = array(
+		private $report_meta_keys = array(
 			'sermon_date',
 			'bible_passage',
 			'sermon_description',
@@ -94,53 +94,1011 @@ if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
 			'sermon_notes',
 			'_wpfc_sermon_duration',
 			'_wpfc_sermon_size',
+			'sermon_bulletin',
+			'sermon_audio_id',
+			'sermon_notes_id',
+			'sermon_bulletin_id',
 		);
 
+		/**
+		 * @var bool
+		 */
+		private $legacy_plugin_active = false;
+
 		public function __construct() {
+			$this->legacy_plugin_active = $this->is_legacy_plugin_active();
+
+			add_action( 'init', array( $this, 'register_content_types' ), 5 );
+			add_action( 'init', array( $this, 'register_shortcodes' ), 20 );
+			add_action( 'init', array( $this, 'maybe_register_media_sizes' ), 20 );
+
 			add_action( 'admin_menu', array( $this, 'register_admin_page' ) );
-			add_action( 'admin_post_smla_download_report', array( $this, 'handle_download_report' ) );
+			add_action( 'admin_notices', array( $this, 'maybe_show_admin_notice' ) );
+			add_action( 'admin_post_sml_download_report', array( $this, 'handle_download_report' ) );
+
+			add_action( 'add_meta_boxes', array( $this, 'register_meta_boxes' ) );
+			add_action( 'save_post_wpfc_sermon', array( $this, 'save_sermon_meta' ) );
+
+			add_action( 'pre_get_posts', array( $this, 'adjust_sermon_queries' ) );
+			add_filter( 'the_content', array( $this, 'filter_sermon_content' ), 20 );
+
+			add_action( 'wp_enqueue_scripts', array( $this, 'enqueue_frontend_styles' ) );
+
+			register_activation_hook( __FILE__, array( __CLASS__, 'activate' ) );
+			register_deactivation_hook( __FILE__, array( __CLASS__, 'deactivate' ) );
+		}
+
+		public static function activate() {
+			$instance = new self();
+			$instance->register_content_types();
+			flush_rewrite_rules();
+		}
+
+		public static function deactivate() {
+			flush_rewrite_rules();
+		}
+
+		public function maybe_show_admin_notice() {
+			if ( ! current_user_can( 'manage_options' ) ) {
+				return;
+			}
+
+			if ( ! $this->legacy_plugin_active ) {
+				return;
+			}
+
+			echo '<div class="notice notice-warning"><p>';
+			echo esc_html__(
+				'Sermon Manager Lite is active while the legacy Sermon Manager plugin is also active. Lite will avoid post type/taxonomy registration conflicts, but you should deactivate the legacy plugin before using Lite as the full replacement.',
+				'sermon-manager-lite'
+			);
+			echo '</p></div>';
+		}
+
+		public function register_content_types() {
+			$this->register_post_type();
+			$this->register_taxonomies();
+		}
+
+		private function register_post_type() {
+			if ( post_type_exists( 'wpfc_sermon' ) ) {
+				return;
+			}
+
+			$archive_slug = $this->get_archive_slug();
+
+			$labels = array(
+				'name'               => __( 'Sermons', 'sermon-manager-lite' ),
+				'singular_name'      => __( 'Sermon', 'sermon-manager-lite' ),
+				'add_new'            => __( 'Add New', 'sermon-manager-lite' ),
+				'add_new_item'       => __( 'Add New Sermon', 'sermon-manager-lite' ),
+				'edit_item'          => __( 'Edit Sermon', 'sermon-manager-lite' ),
+				'new_item'           => __( 'New Sermon', 'sermon-manager-lite' ),
+				'view_item'          => __( 'View Sermon', 'sermon-manager-lite' ),
+				'search_items'       => __( 'Search Sermons', 'sermon-manager-lite' ),
+				'not_found'          => __( 'No sermons found.', 'sermon-manager-lite' ),
+				'not_found_in_trash' => __( 'No sermons found in Trash.', 'sermon-manager-lite' ),
+				'all_items'          => __( 'All Sermons', 'sermon-manager-lite' ),
+				'menu_name'          => __( 'Sermons', 'sermon-manager-lite' ),
+				'name_admin_bar'     => __( 'Sermon', 'sermon-manager-lite' ),
+			);
+
+			register_post_type(
+				'wpfc_sermon',
+				array(
+					'labels'              => $labels,
+					'public'              => true,
+					'publicly_queryable'  => true,
+					'show_ui'             => true,
+					'show_in_menu'        => true,
+					'show_in_rest'        => true,
+					'has_archive'         => $archive_slug,
+					'rewrite'             => array(
+						'slug'       => $archive_slug,
+						'with_front' => false,
+					),
+					'menu_position'       => 20,
+					'menu_icon'           => 'dashicons-format-audio',
+					'supports'            => array(
+						'title',
+						'editor',
+						'excerpt',
+						'thumbnail',
+						'author',
+						'revisions',
+						'page-attributes',
+					),
+					'taxonomies'          => $this->known_taxonomies,
+					'exclude_from_search' => false,
+					'publicly_queryable'  => true,
+					'capability_type'     => 'post',
+					'map_meta_cap'        => true,
+				)
+			);
+		}
+
+		private function register_taxonomies() {
+			$taxonomies = array(
+				'wpfc_preacher' => array(
+					'label_plural'   => __( 'Preachers', 'sermon-manager-lite' ),
+					'label_singular' => __( 'Preacher', 'sermon-manager-lite' ),
+					'slug'           => 'preacher',
+				),
+				'wpfc_sermon_series' => array(
+					'label_plural'   => __( 'Series', 'sermon-manager-lite' ),
+					'label_singular' => __( 'Series', 'sermon-manager-lite' ),
+					'slug'           => 'series',
+				),
+				'wpfc_sermon_topics' => array(
+					'label_plural'   => __( 'Topics', 'sermon-manager-lite' ),
+					'label_singular' => __( 'Topic', 'sermon-manager-lite' ),
+					'slug'           => 'topics',
+				),
+				'wpfc_bible_book' => array(
+					'label_plural'   => __( 'Bible Books', 'sermon-manager-lite' ),
+					'label_singular' => __( 'Bible Book', 'sermon-manager-lite' ),
+					'slug'           => 'book',
+				),
+				'wpfc_service_type' => array(
+					'label_plural'   => __( 'Service Types', 'sermon-manager-lite' ),
+					'label_singular' => __( 'Service Type', 'sermon-manager-lite' ),
+					'slug'           => 'service-type',
+				),
+			);
+
+			foreach ( $taxonomies as $taxonomy => $config ) {
+				if ( taxonomy_exists( $taxonomy ) ) {
+					continue;
+				}
+
+				register_taxonomy(
+					$taxonomy,
+					array( 'wpfc_sermon' ),
+					array(
+						'labels' => array(
+							'name'          => $config['label_plural'],
+							'singular_name' => $config['label_singular'],
+						),
+						'public'            => true,
+						'publicly_queryable'=> true,
+						'show_ui'           => true,
+						'show_in_menu'      => true,
+						'show_admin_column' => true,
+						'show_in_rest'      => true,
+						'hierarchical'      => false,
+						'rewrite'           => array(
+							'slug'       => $config['slug'],
+							'with_front' => false,
+						),
+					)
+				);
+			}
+		}
+
+		public function maybe_register_media_sizes() {
+			add_image_size( 'sml-sermon-thumb', 800, 450, true );
+		}
+
+		public function register_meta_boxes() {
+			if ( $this->legacy_plugin_active ) {
+				return;
+			}
+
+			add_meta_box(
+				'sml_sermon_details',
+				__( 'Sermon Details', 'sermon-manager-lite' ),
+				array( $this, 'render_sermon_meta_box' ),
+				'wpfc_sermon',
+				'normal',
+				'high'
+			);
+		}
+
+		public function render_sermon_meta_box( $post ) {
+			wp_nonce_field( self::NONCE_ACTION, self::NONCE_NAME );
+
+			$fields = $this->get_sermon_meta_values( $post->ID );
+			?>
+			<style>
+				.sml-meta-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+				.sml-meta-grid .sml-full{grid-column:1 / -1}
+				.sml-meta-grid label{display:block;font-weight:600;margin-bottom:4px}
+				.sml-meta-grid input[type="text"],
+				.sml-meta-grid input[type="url"],
+				.sml-meta-grid input[type="number"],
+				.sml-meta-grid textarea{width:100%}
+				.sml-help{color:#666;font-size:12px}
+				@media (max-width:782px){.sml-meta-grid{grid-template-columns:1fr}}
+			</style>
+			<div class="sml-meta-grid">
+				<div>
+					<label for="sml_sermon_date"><?php esc_html_e( 'Sermon Date', 'sermon-manager-lite' ); ?></label>
+					<input type="text" id="sml_sermon_date" name="sml_sermon_date" value="<?php echo esc_attr( $fields['sermon_date_raw'] ); ?>" placeholder="Unix timestamp or YYYY-MM-DD" />
+					<div class="sml-help"><?php esc_html_e( 'Legacy data often uses a Unix timestamp. You can also enter YYYY-MM-DD.', 'sermon-manager-lite' ); ?></div>
+				</div>
+
+				<div>
+					<label for="sml_bible_passage"><?php esc_html_e( 'Bible Passage', 'sermon-manager-lite' ); ?></label>
+					<input type="text" id="sml_bible_passage" name="sml_bible_passage" value="<?php echo esc_attr( $fields['bible_passage'] ); ?>" />
+				</div>
+
+				<div class="sml-full">
+					<label for="sml_sermon_description"><?php esc_html_e( 'Legacy Sermon Description', 'sermon-manager-lite' ); ?></label>
+					<textarea id="sml_sermon_description" name="sml_sermon_description" rows="4"><?php echo esc_textarea( $fields['sermon_description'] ); ?></textarea>
+				</div>
+
+				<div class="sml-full">
+					<label for="sml_sermon_audio"><?php esc_html_e( 'Audio URL', 'sermon-manager-lite' ); ?></label>
+					<input type="url" id="sml_sermon_audio" name="sml_sermon_audio" value="<?php echo esc_attr( $fields['sermon_audio'] ); ?>" />
+				</div>
+
+				<div>
+					<label for="sml_wpfc_sermon_duration"><?php esc_html_e( 'Audio Duration', 'sermon-manager-lite' ); ?></label>
+					<input type="text" id="sml_wpfc_sermon_duration" name="sml_wpfc_sermon_duration" value="<?php echo esc_attr( $fields['_wpfc_sermon_duration'] ); ?>" placeholder="00:42:31" />
+				</div>
+
+				<div>
+					<label for="sml_wpfc_sermon_size"><?php esc_html_e( 'Audio File Size (bytes)', 'sermon-manager-lite' ); ?></label>
+					<input type="text" id="sml_wpfc_sermon_size" name="sml_wpfc_sermon_size" value="<?php echo esc_attr( $fields['_wpfc_sermon_size'] ); ?>" />
+				</div>
+
+				<div class="sml-full">
+					<label for="sml_sermon_video"><?php esc_html_e( 'Video URL / Embed', 'sermon-manager-lite' ); ?></label>
+					<textarea id="sml_sermon_video" name="sml_sermon_video" rows="3"><?php echo esc_textarea( $fields['sermon_video'] ); ?></textarea>
+				</div>
+
+				<div class="sml-full">
+					<label for="sml_sermon_notes"><?php esc_html_e( 'Notes URL', 'sermon-manager-lite' ); ?></label>
+					<input type="url" id="sml_sermon_notes" name="sml_sermon_notes" value="<?php echo esc_attr( $fields['sermon_notes'] ); ?>" />
+				</div>
+
+				<div class="sml-full">
+					<label for="sml_sermon_bulletin"><?php esc_html_e( 'Bulletin URL', 'sermon-manager-lite' ); ?></label>
+					<input type="url" id="sml_sermon_bulletin" name="sml_sermon_bulletin" value="<?php echo esc_attr( $fields['sermon_bulletin'] ); ?>" />
+				</div>
+
+				<div>
+					<label for="sml_sermon_audio_id"><?php esc_html_e( 'Audio Attachment ID', 'sermon-manager-lite' ); ?></label>
+					<input type="number" id="sml_sermon_audio_id" name="sml_sermon_audio_id" value="<?php echo esc_attr( $fields['sermon_audio_id'] ); ?>" />
+				</div>
+
+				<div>
+					<label for="sml_sermon_notes_id"><?php esc_html_e( 'Notes Attachment ID', 'sermon-manager-lite' ); ?></label>
+					<input type="number" id="sml_sermon_notes_id" name="sml_sermon_notes_id" value="<?php echo esc_attr( $fields['sermon_notes_id'] ); ?>" />
+				</div>
+
+				<div>
+					<label for="sml_sermon_bulletin_id"><?php esc_html_e( 'Bulletin Attachment ID', 'sermon-manager-lite' ); ?></label>
+					<input type="number" id="sml_sermon_bulletin_id" name="sml_sermon_bulletin_id" value="<?php echo esc_attr( $fields['sermon_bulletin_id'] ); ?>" />
+				</div>
+			</div>
+			<?php
+		}
+
+		public function save_sermon_meta( $post_id ) {
+			if ( ! isset( $_POST[ self::NONCE_NAME ] ) ) {
+				return;
+			}
+
+			if ( ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST[ self::NONCE_NAME ] ) ), self::NONCE_ACTION ) ) {
+				return;
+			}
+
+			if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) {
+				return;
+			}
+
+			if ( wp_is_post_revision( $post_id ) ) {
+				return;
+			}
+
+			if ( ! current_user_can( 'edit_post', $post_id ) ) {
+				return;
+			}
+
+			$sermon_date_raw = isset( $_POST['sml_sermon_date'] ) ? sanitize_text_field( wp_unslash( $_POST['sml_sermon_date'] ) ) : '';
+			$sermon_date     = $this->normalize_sermon_date_for_storage( $sermon_date_raw );
+
+			$this->save_meta_value( $post_id, 'sermon_date', $sermon_date );
+			$this->save_meta_value( $post_id, 'sermon_date_auto', $sermon_date );
+
+			$this->save_meta_value( $post_id, 'bible_passage', isset( $_POST['sml_bible_passage'] ) ? sanitize_text_field( wp_unslash( $_POST['sml_bible_passage'] ) ) : '' );
+			$this->save_meta_value( $post_id, 'sermon_description', isset( $_POST['sml_sermon_description'] ) ? wp_kses_post( wp_unslash( $_POST['sml_sermon_description'] ) ) : '' );
+			$this->save_meta_value( $post_id, 'sermon_audio', isset( $_POST['sml_sermon_audio'] ) ? esc_url_raw( wp_unslash( $_POST['sml_sermon_audio'] ) ) : '' );
+			$this->save_meta_value( $post_id, 'sermon_video', isset( $_POST['sml_sermon_video'] ) ? wp_kses_post( wp_unslash( $_POST['sml_sermon_video'] ) ) : '' );
+			$this->save_meta_value( $post_id, 'sermon_notes', isset( $_POST['sml_sermon_notes'] ) ? esc_url_raw( wp_unslash( $_POST['sml_sermon_notes'] ) ) : '' );
+			$this->save_meta_value( $post_id, 'sermon_bulletin', isset( $_POST['sml_sermon_bulletin'] ) ? esc_url_raw( wp_unslash( $_POST['sml_sermon_bulletin'] ) ) : '' );
+
+			$this->save_meta_value( $post_id, '_wpfc_sermon_duration', isset( $_POST['sml_wpfc_sermon_duration'] ) ? sanitize_text_field( wp_unslash( $_POST['sml_wpfc_sermon_duration'] ) ) : '' );
+			$this->save_meta_value( $post_id, '_wpfc_sermon_size', isset( $_POST['sml_wpfc_sermon_size'] ) ? sanitize_text_field( wp_unslash( $_POST['sml_wpfc_sermon_size'] ) ) : '' );
+
+			$this->save_meta_value( $post_id, 'sermon_audio_id', isset( $_POST['sml_sermon_audio_id'] ) ? absint( $_POST['sml_sermon_audio_id'] ) : '' );
+			$this->save_meta_value( $post_id, 'sermon_notes_id', isset( $_POST['sml_sermon_notes_id'] ) ? absint( $_POST['sml_sermon_notes_id'] ) : '' );
+			$this->save_meta_value( $post_id, 'sermon_bulletin_id', isset( $_POST['sml_sermon_bulletin_id'] ) ? absint( $_POST['sml_sermon_bulletin_id'] ) : '' );
+		}
+
+		private function save_meta_value( $post_id, $key, $value ) {
+			if ( '' === $value || null === $value ) {
+				delete_post_meta( $post_id, $key );
+				return;
+			}
+
+			update_post_meta( $post_id, $key, $value );
+		}
+
+		public function adjust_sermon_queries( $query ) {
+			if ( is_admin() || ! $query->is_main_query() ) {
+				return;
+			}
+
+			$is_relevant = (
+				$query->is_post_type_archive( 'wpfc_sermon' )
+				|| $query->is_tax( $this->known_taxonomies )
+			);
+
+			if ( ! $is_relevant ) {
+				return;
+			}
+
+			$sort = isset( $_GET['sermon_sort'] ) ? sanitize_key( wp_unslash( $_GET['sermon_sort'] ) ) : '';
+
+			$query->set( 'post_type', 'wpfc_sermon' );
+			$query->set( 'posts_per_page', $this->get_sermon_count() );
+
+			switch ( $sort ) {
+				case 'title_asc':
+					$query->set( 'orderby', 'title' );
+					$query->set( 'order', 'ASC' );
+					break;
+
+				case 'title_desc':
+					$query->set( 'orderby', 'title' );
+					$query->set( 'order', 'DESC' );
+					break;
+
+				case 'oldest':
+					$query->set( 'meta_key', 'sermon_date' );
+					$query->set( 'orderby', 'meta_value_num' );
+					$query->set( 'order', 'ASC' );
+					break;
+
+				case 'newest':
+				default:
+					$query->set( 'meta_key', 'sermon_date' );
+					$query->set( 'orderby', 'meta_value_num' );
+					$query->set( 'order', 'DESC' );
+					break;
+			}
+		}
+
+		public function filter_sermon_content( $content ) {
+			if ( is_admin() ) {
+				return $content;
+			}
+
+			if ( ! is_singular( 'wpfc_sermon' ) || ! in_the_loop() || ! is_main_query() ) {
+				return $content;
+			}
+
+			$post_id = get_the_ID();
+			if ( ! $post_id ) {
+				return $content;
+			}
+
+			$meta_output = $this->render_single_sermon_header( $post_id );
+			$media_output = $this->render_single_sermon_media( $post_id );
+			$body_output  = trim( (string) $content );
+
+			if ( '' === $body_output ) {
+				$legacy_description = (string) get_post_meta( $post_id, 'sermon_description', true );
+				if ( '' !== trim( $legacy_description ) ) {
+					$body_output = wpautop( wp_kses_post( $legacy_description ) );
+				}
+			}
+
+			$downloads = $this->render_single_sermon_downloads( $post_id );
+
+			$wrapped = '<div class="sml-sermon-single-wrap">';
+			$wrapped .= $meta_output;
+			$wrapped .= $media_output;
+			$wrapped .= $downloads;
+
+			if ( '' !== trim( $body_output ) ) {
+				$wrapped .= '<div class="sml-sermon-body">' . $body_output . '</div>';
+			}
+
+			$wrapped .= '</div>';
+
+			return $wrapped;
+		}
+
+		private function render_single_sermon_header( $post_id ) {
+			$items = array();
+
+			$date = $this->get_formatted_sermon_date( $post_id );
+			if ( '' !== $date ) {
+				$items[] = '<div class="sml-sermon-meta-item"><strong>' . esc_html__( 'Date:', 'sermon-manager-lite' ) . '</strong> ' . esc_html( $date ) . '</div>';
+			}
+
+			$passage = (string) get_post_meta( $post_id, 'bible_passage', true );
+			if ( '' !== trim( $passage ) ) {
+				$items[] = '<div class="sml-sermon-meta-item"><strong>' . esc_html__( 'Passage:', 'sermon-manager-lite' ) . '</strong> ' . esc_html( $passage ) . '</div>';
+			}
+
+			$taxonomy_map = array(
+				'wpfc_preacher'      => __( 'Preacher', 'sermon-manager-lite' ),
+				'wpfc_sermon_series' => __( 'Series', 'sermon-manager-lite' ),
+				'wpfc_sermon_topics' => __( 'Topics', 'sermon-manager-lite' ),
+				'wpfc_bible_book'    => __( 'Book', 'sermon-manager-lite' ),
+				'wpfc_service_type'  => __( 'Service Type', 'sermon-manager-lite' ),
+			);
+
+			foreach ( $taxonomy_map as $taxonomy => $label ) {
+				$list = get_the_term_list( $post_id, $taxonomy, '', ', ', '' );
+				if ( $list ) {
+					$items[] = '<div class="sml-sermon-meta-item"><strong>' . esc_html( $label ) . ':</strong> ' . wp_kses_post( $list ) . '</div>';
+				}
+			}
+
+			if ( empty( $items ) ) {
+				return '';
+			}
+
+			return '<div class="sml-sermon-meta">' . implode( '', $items ) . '</div>';
+		}
+
+		private function render_single_sermon_media( $post_id ) {
+			$output = '';
+
+			$audio_url = (string) get_post_meta( $post_id, 'sermon_audio', true );
+			if ( '' !== trim( $audio_url ) ) {
+				$output .= '<div class="sml-sermon-media sml-sermon-audio">';
+				$output .= '<h3>' . esc_html__( 'Listen', 'sermon-manager-lite' ) . '</h3>';
+				$output .= wp_audio_shortcode(
+					array(
+						'src' => esc_url( $audio_url ),
+					)
+				);
+
+				$duration = (string) get_post_meta( $post_id, '_wpfc_sermon_duration', true );
+				$size     = (string) get_post_meta( $post_id, '_wpfc_sermon_size', true );
+				$meta_bits = array();
+
+				if ( '' !== trim( $duration ) ) {
+					$meta_bits[] = esc_html__( 'Duration:', 'sermon-manager-lite' ) . ' ' . esc_html( $duration );
+				}
+
+				if ( '' !== trim( $size ) && is_numeric( $size ) ) {
+					$meta_bits[] = esc_html__( 'Size:', 'sermon-manager-lite' ) . ' ' . esc_html( size_format( (int) $size ) );
+				}
+
+				if ( ! empty( $meta_bits ) ) {
+					$output .= '<div class="sml-sermon-media-meta">' . esc_html( implode( ' | ', $meta_bits ) ) . '</div>';
+				}
+
+				$output .= '</div>';
+			}
+
+			$video = (string) get_post_meta( $post_id, 'sermon_video', true );
+			if ( '' !== trim( $video ) ) {
+				$output .= '<div class="sml-sermon-media sml-sermon-video">';
+				$output .= '<h3>' . esc_html__( 'Watch', 'sermon-manager-lite' ) . '</h3>';
+				$output .= $this->render_video_value( $video );
+				$output .= '</div>';
+			}
+
+			return $output;
+		}
+
+		private function render_single_sermon_downloads( $post_id ) {
+			$notes    = (string) get_post_meta( $post_id, 'sermon_notes', true );
+			$bulletin = (string) get_post_meta( $post_id, 'sermon_bulletin', true );
+
+			$links = array();
+
+			if ( '' !== trim( $notes ) ) {
+				$links[] = '<a class="sml-download-link" href="' . esc_url( $notes ) . '">' . esc_html__( 'Notes', 'sermon-manager-lite' ) . '</a>';
+			}
+
+			if ( '' !== trim( $bulletin ) ) {
+				$links[] = '<a class="sml-download-link" href="' . esc_url( $bulletin ) . '">' . esc_html__( 'Bulletin', 'sermon-manager-lite' ) . '</a>';
+			}
+
+			if ( empty( $links ) ) {
+				return '';
+			}
+
+			return '<div class="sml-sermon-downloads">' . implode( '', $links ) . '</div>';
+		}
+
+		private function render_video_value( $video ) {
+			$video = trim( (string) $video );
+
+			if ( filter_var( $video, FILTER_VALIDATE_URL ) ) {
+				$oembed = wp_oembed_get( $video );
+				if ( $oembed ) {
+					return $oembed;
+				}
+
+				return wp_video_shortcode(
+					array(
+						'src' => esc_url( $video ),
+					)
+				);
+			}
+
+			if ( false !== stripos( $video, '<iframe' ) ) {
+				return wp_kses(
+					$video,
+					array(
+						'iframe' => array(
+							'src'             => true,
+							'width'           => true,
+							'height'          => true,
+							'frameborder'     => true,
+							'allow'           => true,
+							'allowfullscreen' => true,
+							'loading'         => true,
+							'referrerpolicy'  => true,
+							'title'           => true,
+						),
+					)
+				);
+			}
+
+			return wpautop( wp_kses_post( $video ) );
+		}
+
+		public function enqueue_frontend_styles() {
+			$css = '
+			.sml-sermon-meta{margin:0 0 1.25rem;padding:1rem;border:1px solid #ddd;border-radius:8px;background:#fafafa}
+			.sml-sermon-meta-item + .sml-sermon-meta-item{margin-top:.35rem}
+			.sml-sermon-media{margin:0 0 1.25rem}
+			.sml-sermon-media h3{margin:0 0 .5rem}
+			.sml-sermon-media-meta{margin-top:.45rem;color:#666;font-size:.95rem}
+			.sml-sermon-downloads{display:flex;gap:.75rem;flex-wrap:wrap;margin:0 0 1.25rem}
+			.sml-download-link{display:inline-block;padding:.5rem .8rem;border:1px solid #ccc;border-radius:6px;text-decoration:none}
+			.sml-sermon-loop{display:grid;gap:1.25rem}
+			.sml-sermon-card{padding:1rem;border:1px solid #ddd;border-radius:8px;background:#fff}
+			.sml-sermon-card-title{margin:0 0 .35rem;font-size:1.25rem;line-height:1.25}
+			.sml-sermon-card-meta{margin:0 0 .55rem;color:#666;font-size:.95rem}
+			.sml-sermon-card-tax{margin:.5rem 0}
+			.sml-sermon-tax-chip{display:inline-block;margin:0 .35rem .35rem 0;padding:.2rem .5rem;border-radius:999px;background:#f1f1f1;font-size:.85rem}
+			.sml-sermon-sort-form{display:flex;gap:.75rem;align-items:end;flex-wrap:wrap;margin:0 0 1rem}
+			.sml-sermon-sort-form label{display:flex;flex-direction:column;font-weight:600}
+			.sml-sermon-sort-form select,.sml-sermon-sort-form button{padding:.45rem .6rem}
+			.sml-sermon-pagination{margin-top:1.25rem}
+			.sml-sermon-pagination .page-numbers{display:inline-block;margin-right:.4rem}
+			.sml-audit-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+			.sml-audit-card{padding:16px;background:#fff;border:1px solid #dcdcde;border-radius:8px}
+			.sml-audit-card h2{margin-top:0}
+			@media (max-width:782px){
+				.sml-audit-grid{grid-template-columns:1fr}
+			}
+			';
+
+			wp_register_style( 'sml-inline', false, array(), self::VERSION );
+			wp_enqueue_style( 'sml-inline' );
+			wp_add_inline_style( 'sml-inline', $css );
+		}
+
+		public function register_shortcodes() {
+			add_shortcode( 'sermons', array( $this, 'shortcode_sermons' ) );
+			add_shortcode( 'sermon_sort_fields', array( $this, 'shortcode_sermon_sort_fields' ) );
+		}
+
+		public function shortcode_sermon_sort_fields( $atts = array() ) {
+			$atts = shortcode_atts(
+				array(
+					'label' => __( 'Sort Sermons', 'sermon-manager-lite' ),
+				),
+				$atts,
+				'sermon_sort_fields'
+			);
+
+			$current_sort = isset( $_GET['sermon_sort'] ) ? sanitize_key( wp_unslash( $_GET['sermon_sort'] ) ) : 'newest';
+
+			ob_start();
+			?>
+			<form method="get" class="sml-sermon-sort-form">
+				<label>
+					<span><?php echo esc_html( $atts['label'] ); ?></span>
+					<select name="sermon_sort">
+						<option value="newest" <?php selected( $current_sort, 'newest' ); ?>><?php esc_html_e( 'Newest First', 'sermon-manager-lite' ); ?></option>
+						<option value="oldest" <?php selected( $current_sort, 'oldest' ); ?>><?php esc_html_e( 'Oldest First', 'sermon-manager-lite' ); ?></option>
+						<option value="title_asc" <?php selected( $current_sort, 'title_asc' ); ?>><?php esc_html_e( 'Title A–Z', 'sermon-manager-lite' ); ?></option>
+						<option value="title_desc" <?php selected( $current_sort, 'title_desc' ); ?>><?php esc_html_e( 'Title Z–A', 'sermon-manager-lite' ); ?></option>
+					</select>
+				</label>
+				<?php echo $this->render_preserved_query_args( array( 'sermon_sort', 'paged' ) ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped ?>
+				<button type="submit"><?php esc_html_e( 'Apply', 'sermon-manager-lite' ); ?></button>
+			</form>
+			<?php
+			return ob_get_clean();
+		}
+
+		public function shortcode_sermons( $atts = array() ) {
+			$atts = shortcode_atts(
+				array(
+					'posts_per_page' => $this->get_sermon_count(),
+					'preacher'       => '',
+					'series'         => '',
+					'topic'          => '',
+					'book'           => '',
+					'service_type'   => '',
+					'pagination'     => 'true',
+					'show_sort'      => 'false',
+				),
+				$atts,
+				'sermons'
+			);
+
+			$paged = max(
+				1,
+				get_query_var( 'paged' ) ? (int) get_query_var( 'paged' ) : ( isset( $_GET['paged'] ) ? (int) $_GET['paged'] : 1 )
+			);
+
+			$sort = isset( $_GET['sermon_sort'] ) ? sanitize_key( wp_unslash( $_GET['sermon_sort'] ) ) : 'newest';
+
+			$args = array(
+				'post_type'      => 'wpfc_sermon',
+				'post_status'    => 'publish',
+				'posts_per_page' => (int) $atts['posts_per_page'],
+				'paged'          => $paged,
+			);
+
+			switch ( $sort ) {
+				case 'title_asc':
+					$args['orderby'] = 'title';
+					$args['order']   = 'ASC';
+					break;
+
+				case 'title_desc':
+					$args['orderby'] = 'title';
+					$args['order']   = 'DESC';
+					break;
+
+				case 'oldest':
+					$args['meta_key'] = 'sermon_date';
+					$args['orderby']  = 'meta_value_num';
+					$args['order']    = 'ASC';
+					break;
+
+				case 'newest':
+				default:
+					$args['meta_key'] = 'sermon_date';
+					$args['orderby']  = 'meta_value_num';
+					$args['order']    = 'DESC';
+					break;
+			}
+
+			$tax_query = array();
+
+			$map = array(
+				'preacher'     => 'wpfc_preacher',
+				'series'       => 'wpfc_sermon_series',
+				'topic'        => 'wpfc_sermon_topics',
+				'book'         => 'wpfc_bible_book',
+				'service_type' => 'wpfc_service_type',
+			);
+
+			foreach ( $map as $att_key => $taxonomy ) {
+				$value = '';
+				if ( isset( $_GET[ $att_key ] ) ) {
+					$value = sanitize_title( wp_unslash( $_GET[ $att_key ] ) );
+				} elseif ( '' !== $atts[ $att_key ] ) {
+					$value = sanitize_title( $atts[ $att_key ] );
+				}
+
+				if ( '' !== $value ) {
+					$tax_query[] = array(
+						'taxonomy' => $taxonomy,
+						'field'    => 'slug',
+						'terms'    => $value,
+					);
+				}
+			}
+
+			if ( ! empty( $tax_query ) ) {
+				if ( count( $tax_query ) > 1 ) {
+					$tax_query['relation'] = 'AND';
+				}
+				$args['tax_query'] = $tax_query;
+			}
+
+			$query = new WP_Query( $args );
+
+			ob_start();
+
+			if ( 'true' === $atts['show_sort'] ) {
+				echo do_shortcode( '[sermon_sort_fields]' );
+			}
+
+			if ( $query->have_posts() ) {
+				echo '<div class="sml-sermon-loop">';
+
+				while ( $query->have_posts() ) {
+					$query->the_post();
+
+					$post_id = get_the_ID();
+					$title   = get_the_title();
+					if ( '' === trim( $title ) ) {
+						$title = __( 'Untitled Sermon', 'sermon-manager-lite' );
+					}
+
+					echo '<article class="sml-sermon-card">';
+
+					$thumb = get_the_post_thumbnail( $post_id, 'sml-sermon-thumb' );
+					if ( $thumb ) {
+						echo '<div class="sml-sermon-card-thumb"><a href="' . esc_url( get_permalink() ) . '">' . $thumb . '</a></div>';
+					}
+
+					echo '<h3 class="sml-sermon-card-title"><a href="' . esc_url( get_permalink() ) . '">' . esc_html( $title ) . '</a></h3>';
+
+					$meta_bits = array();
+					$date = $this->get_formatted_sermon_date( $post_id );
+					if ( '' !== $date ) {
+						$meta_bits[] = $date;
+					}
+
+					$passage = (string) get_post_meta( $post_id, 'bible_passage', true );
+					if ( '' !== trim( $passage ) ) {
+						$meta_bits[] = $passage;
+					}
+
+					if ( ! empty( $meta_bits ) ) {
+						echo '<div class="sml-sermon-card-meta">' . esc_html( implode( ' | ', $meta_bits ) ) . '</div>';
+					}
+
+					echo $this->render_taxonomy_chips( $post_id ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+
+					$summary = $this->get_sermon_summary( $post_id );
+					if ( '' !== $summary ) {
+						echo '<div class="sml-sermon-card-summary">' . wp_kses_post( wpautop( $summary ) ) . '</div>';
+					}
+
+					echo '<p><a href="' . esc_url( get_permalink() ) . '">' . esc_html__( 'Read / Listen', 'sermon-manager-lite' ) . '</a></p>';
+
+					echo '</article>';
+				}
+
+				echo '</div>';
+
+				if ( 'true' === $atts['pagination'] && $query->max_num_pages > 1 ) {
+					$big = 999999999;
+					$pagination = paginate_links(
+						array(
+							'base'      => str_replace( $big, '%#%', esc_url( add_query_arg( 'paged', $big ) ) ),
+							'format'    => '',
+							'current'   => max( 1, $paged ),
+							'total'     => (int) $query->max_num_pages,
+							'type'      => 'plain',
+							'prev_text' => __( '« Previous', 'sermon-manager-lite' ),
+							'next_text' => __( 'Next »', 'sermon-manager-lite' ),
+						)
+					);
+
+					if ( $pagination ) {
+						echo '<nav class="sml-sermon-pagination">' . wp_kses_post( $pagination ) . '</nav>';
+					}
+				}
+			} else {
+				echo '<p>' . esc_html__( 'No sermons found.', 'sermon-manager-lite' ) . '</p>';
+			}
+
+			wp_reset_postdata();
+
+			return ob_get_clean();
+		}
+
+		private function render_preserved_query_args( $exclude = array() ) {
+			$output = '';
+
+			foreach ( $_GET as $key => $value ) {
+				$key = (string) $key;
+				if ( in_array( $key, $exclude, true ) ) {
+					continue;
+				}
+
+				if ( is_array( $value ) ) {
+					continue;
+				}
+
+				$output .= '<input type="hidden" name="' . esc_attr( $key ) . '" value="' . esc_attr( sanitize_text_field( wp_unslash( $value ) ) ) . '" />';
+			}
+
+			return $output;
+		}
+
+		private function render_taxonomy_chips( $post_id ) {
+			$taxonomies = array(
+				'wpfc_preacher',
+				'wpfc_sermon_series',
+				'wpfc_sermon_topics',
+				'wpfc_bible_book',
+				'wpfc_service_type',
+			);
+
+			$chips = array();
+
+			foreach ( $taxonomies as $taxonomy ) {
+				$terms = get_the_terms( $post_id, $taxonomy );
+				if ( is_wp_error( $terms ) || empty( $terms ) ) {
+					continue;
+				}
+
+				foreach ( $terms as $term ) {
+					$chips[] = '<span class="sml-sermon-tax-chip">' . esc_html( $term->name ) . '</span>';
+				}
+			}
+
+			if ( empty( $chips ) ) {
+				return '';
+			}
+
+			return '<div class="sml-sermon-card-tax">' . implode( '', $chips ) . '</div>';
+		}
+
+		private function get_sermon_summary( $post_id ) {
+			$post = get_post( $post_id );
+			if ( ! $post ) {
+				return '';
+			}
+
+			if ( '' !== trim( (string) $post->post_excerpt ) ) {
+				return $post->post_excerpt;
+			}
+
+			if ( '' !== trim( (string) $post->post_content ) ) {
+				return wp_trim_words( wp_strip_all_tags( $post->post_content ), 30 );
+			}
+
+			$legacy_description = (string) get_post_meta( $post_id, 'sermon_description', true );
+			if ( '' !== trim( $legacy_description ) ) {
+				return wp_trim_words( wp_strip_all_tags( $legacy_description ), 30 );
+			}
+
+			return '';
+		}
+
+		private function get_archive_slug() {
+			$slug = (string) get_option( 'sermonmanager_archive_slug', 'sermons' );
+			$slug = sanitize_title( $slug );
+
+			if ( '' === $slug ) {
+				$slug = 'sermons';
+			}
+
+			return $slug;
+		}
+
+		private function get_sermon_count() {
+			$count = absint( get_option( 'sermonmanager_sermon_count', 10 ) );
+			if ( $count < 1 ) {
+				$count = 10;
+			}
+			return $count;
+		}
+
+		private function get_formatted_sermon_date( $post_id ) {
+			$raw = get_post_meta( $post_id, 'sermon_date', true );
+
+			if ( '' === $raw || null === $raw ) {
+				return '';
+			}
+
+			if ( is_numeric( $raw ) ) {
+				return wp_date( get_option( 'date_format' ), (int) $raw );
+			}
+
+			$timestamp = strtotime( (string) $raw );
+			if ( false !== $timestamp ) {
+				return wp_date( get_option( 'date_format' ), $timestamp );
+			}
+
+			return (string) $raw;
+		}
+
+		private function normalize_sermon_date_for_storage( $raw ) {
+			$raw = trim( (string) $raw );
+
+			if ( '' === $raw ) {
+				return '';
+			}
+
+			if ( ctype_digit( $raw ) ) {
+				return $raw;
+			}
+
+			$timestamp = strtotime( $raw );
+			if ( false !== $timestamp ) {
+				return (string) $timestamp;
+			}
+
+			return $raw;
+		}
+
+		private function get_sermon_meta_values( $post_id ) {
+			return array(
+				'sermon_date_raw'        => (string) get_post_meta( $post_id, 'sermon_date', true ),
+				'bible_passage'          => (string) get_post_meta( $post_id, 'bible_passage', true ),
+				'sermon_description'     => (string) get_post_meta( $post_id, 'sermon_description', true ),
+				'sermon_audio'           => (string) get_post_meta( $post_id, 'sermon_audio', true ),
+				'sermon_video'           => (string) get_post_meta( $post_id, 'sermon_video', true ),
+				'sermon_notes'           => (string) get_post_meta( $post_id, 'sermon_notes', true ),
+				'sermon_bulletin'        => (string) get_post_meta( $post_id, 'sermon_bulletin', true ),
+				'_wpfc_sermon_duration'  => (string) get_post_meta( $post_id, '_wpfc_sermon_duration', true ),
+				'_wpfc_sermon_size'      => (string) get_post_meta( $post_id, '_wpfc_sermon_size', true ),
+				'sermon_audio_id'        => (string) get_post_meta( $post_id, 'sermon_audio_id', true ),
+				'sermon_notes_id'        => (string) get_post_meta( $post_id, 'sermon_notes_id', true ),
+				'sermon_bulletin_id'     => (string) get_post_meta( $post_id, 'sermon_bulletin_id', true ),
+			);
+		}
+
+		private function is_legacy_plugin_active() {
+			if ( ! function_exists( 'is_plugin_active' ) ) {
+				require_once ABSPATH . 'wp-admin/includes/plugin.php';
+			}
+
+			return is_plugin_active( 'sermon-manager-for-wordpress/sermons.php' );
 		}
 
 		public function register_admin_page() {
 			add_management_page(
-				'Sermon Manager Lite Audit',
-				'Sermon Manager Lite Audit',
+				__( 'Sermon Manager Lite', 'sermon-manager-lite' ),
+				__( 'Sermon Manager Lite', 'sermon-manager-lite' ),
 				'manage_options',
-				'sermon-manager-lite-audit',
+				'sermon-manager-lite',
 				array( $this, 'render_admin_page' )
 			);
 		}
 
 		public function render_admin_page() {
 			if ( ! current_user_can( 'manage_options' ) ) {
-				wp_die( esc_html__( 'You do not have permission to access this page.', 'sermon-manager-lite-audit' ) );
+				wp_die( esc_html__( 'You do not have permission to access this page.', 'sermon-manager-lite' ) );
 			}
 
 			$report = $this->generate_report();
 			?>
 			<div class="wrap">
-				<h1>Sermon Manager Lite Audit</h1>
-				<p>This page inspects how the current site is using the legacy Sermon Manager plugin so a compatible Sermon Manager Lite replacement can be built safely.</p>
+				<h1><?php esc_html_e( 'Sermon Manager Lite', 'sermon-manager-lite' ); ?></h1>
 
-				<p>
-					<a class="button button-secondary" href="<?php echo esc_url( wp_nonce_url( admin_url( 'admin-post.php?action=smla_download_report' ), 'smla_download_report' ) ); ?>">Download TXT Report</a>
-				</p>
+				<div class="sml-audit-grid">
+					<div class="sml-audit-card">
+						<h2><?php esc_html_e( 'Compatibility Summary', 'sermon-manager-lite' ); ?></h2>
+						<p><strong><?php esc_html_e( 'Legacy plugin active:', 'sermon-manager-lite' ); ?></strong> <?php echo esc_html( $this->legacy_plugin_active ? 'yes' : 'no' ); ?></p>
+						<p><strong><?php esc_html_e( 'Archive slug:', 'sermon-manager-lite' ); ?></strong> <?php echo esc_html( $this->get_archive_slug() ); ?></p>
+						<p><strong><?php esc_html_e( 'Configured sermons per page:', 'sermon-manager-lite' ); ?></strong> <?php echo esc_html( (string) $this->get_sermon_count() ); ?></p>
+						<p><strong><?php esc_html_e( 'Archive URL:', 'sermon-manager-lite' ); ?></strong> <?php echo esc_html( home_url( '/' . $this->get_archive_slug() . '/' ) ); ?></p>
+					</div>
 
-				<textarea readonly="readonly" spellcheck="false" style="width:100%;min-height:700px;font-family:Consolas,Monaco,monospace;"><?php echo esc_textarea( $report ); ?></textarea>
+					<div class="sml-audit-card">
+						<h2><?php esc_html_e( 'Actions', 'sermon-manager-lite' ); ?></h2>
+						<p>
+							<a class="button button-primary" href="<?php echo esc_url( home_url( '/' . $this->get_archive_slug() . '/' ) ); ?>" target="_blank" rel="noopener"><?php esc_html_e( 'Open Sermon Archive', 'sermon-manager-lite' ); ?></a>
+						</p>
+						<p>
+							<a class="button button-secondary" href="<?php echo esc_url( wp_nonce_url( admin_url( 'admin-post.php?action=sml_download_report' ), 'sml_download_report' ) ); ?>"><?php esc_html_e( 'Download TXT Report', 'sermon-manager-lite' ); ?></a>
+						</p>
+					</div>
+				</div>
+
+				<h2 style="margin-top:24px;"><?php esc_html_e( 'Diagnostic Report', 'sermon-manager-lite' ); ?></h2>
+				<textarea readonly="readonly" spellcheck="false" style="width:100%;min-height:720px;font-family:Consolas,Monaco,monospace;"><?php echo esc_textarea( $report ); ?></textarea>
 			</div>
 			<?php
 		}
 
 		public function handle_download_report() {
 			if ( ! current_user_can( 'manage_options' ) ) {
-				wp_die( esc_html__( 'You do not have permission to perform this action.', 'sermon-manager-lite-audit' ) );
+				wp_die( esc_html__( 'You do not have permission to perform this action.', 'sermon-manager-lite' ) );
 			}
 
-			check_admin_referer( 'smla_download_report' );
+			check_admin_referer( 'sml_download_report' );
 
 			$report = $this->generate_report();
 			$site   = sanitize_title( wp_parse_url( home_url(), PHP_URL_HOST ) );
-			$file   = 'sermon-manager-lite-audit-' . $site . '-' . gmdate( 'Ymd-His' ) . '.txt';
+			$file   = 'sermon-manager-lite-report-' . $site . '-' . gmdate( 'Ymd-His' ) . '.txt';
 
 			nocache_headers();
 			header( 'Content-Type: text/plain; charset=utf-8' );
@@ -149,20 +1107,17 @@ if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
 			exit;
 		}
 
-		/**
-		 * Main report generator.
-		 *
-		 * @return string
-		 */
 		private function generate_report() {
 			$lines   = array();
-			$lines[] = 'SERMON MANAGER LITE AUDIT REPORT';
+			$lines[] = 'SERMON MANAGER LITE REPORT';
 			$lines[] = 'Generated: ' . gmdate( 'Y-m-d H:i:s' ) . ' UTC';
 			$lines[] = 'Home URL: ' . home_url( '/' );
 			$lines[] = 'Site Name: ' . get_bloginfo( 'name' );
 			$lines[] = 'WP Version: ' . get_bloginfo( 'version' );
 			$lines[] = 'Theme: ' . $this->get_theme_label();
 			$lines[] = 'PHP Version: ' . PHP_VERSION;
+			$lines[] = 'Lite Version: ' . self::VERSION;
+			$lines[] = 'Legacy plugin active: ' . ( $this->legacy_plugin_active ? 'yes' : 'no' );
 			$lines[] = str_repeat( '=', 80 );
 
 			$lines = array_merge( $lines, $this->section_plugin_status() );
@@ -170,8 +1125,6 @@ if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
 			$lines = array_merge( $lines, $this->section_taxonomy_details() );
 			$lines = array_merge( $lines, $this->section_meta_usage() );
 			$lines = array_merge( $lines, $this->section_shortcode_usage() );
-			$lines = array_merge( $lines, $this->section_template_overrides() );
-			$lines = array_merge( $lines, $this->section_theme_code_refs() );
 			$lines = array_merge( $lines, $this->section_menu_and_permalink_usage() );
 			$lines = array_merge( $lines, $this->section_options_snapshot() );
 			$lines = array_merge( $lines, $this->section_summary() );
@@ -179,44 +1132,12 @@ if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
 			return implode( "\n", $lines );
 		}
 
-		/**
-		 * SECTION: Plugin status
-		 *
-		 * @return array
-		 */
 		private function section_plugin_status() {
 			$lines   = array();
 			$lines[] = '';
 			$lines[] = '[PLUGIN STATUS]';
-
-			if ( ! function_exists( 'get_plugins' ) ) {
-				require_once ABSPATH . 'wp-admin/includes/plugin.php';
-			}
-
-			$plugins            = get_plugins();
-			$sermon_plugin_file = $this->find_sermon_manager_plugin_file( $plugins );
-			$is_active          = false;
-			$plugin_data        = array();
-
-			if ( $sermon_plugin_file ) {
-				$plugin_data = $plugins[ $sermon_plugin_file ];
-
-				if ( ! function_exists( 'is_plugin_active' ) ) {
-					require_once ABSPATH . 'wp-admin/includes/plugin.php';
-				}
-
-				$is_active = is_plugin_active( $sermon_plugin_file );
-			}
-
-			$lines[] = 'Sermon Manager plugin file: ' . ( $sermon_plugin_file ? $sermon_plugin_file : 'NOT FOUND' );
-			$lines[] = 'Sermon Manager active: ' . ( $is_active ? 'yes' : 'no' );
-
-			if ( ! empty( $plugin_data ) ) {
-				$lines[] = 'Sermon Manager name: ' . $this->clean_line( $plugin_data['Name'] ?? '' );
-				$lines[] = 'Sermon Manager version: ' . $this->clean_line( $plugin_data['Version'] ?? '' );
-				$lines[] = 'Sermon Manager author: ' . $this->clean_line( wp_strip_all_tags( $plugin_data['Author'] ?? '' ) );
-			}
-
+			$lines[] = 'Archive slug option: ' . $this->get_archive_slug();
+			$lines[] = 'Sermon count option: ' . $this->get_sermon_count();
 			$lines[] = 'Post type wpfc_sermon registered: ' . ( post_type_exists( 'wpfc_sermon' ) ? 'yes' : 'no' );
 
 			foreach ( $this->known_taxonomies as $taxonomy ) {
@@ -226,11 +1147,6 @@ if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
 			return $lines;
 		}
 
-		/**
-		 * SECTION: CPT + content counts
-		 *
-		 * @return array
-		 */
 		private function section_content_counts() {
 			global $wpdb;
 
@@ -286,12 +1202,10 @@ if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
 				)
 			);
 
-			$lines[] = 'Private sermons: ' . $private_count;
-			$lines[] = 'Scheduled sermons: ' . $future_count;
-
 			$content_nonempty = (int) $wpdb->get_var(
 				$wpdb->prepare(
-					"SELECT COUNT(*) FROM {$wpdb->posts}
+					"SELECT COUNT(*)
+					 FROM {$wpdb->posts}
 					 WHERE post_type = %s
 					 AND post_content IS NOT NULL
 					 AND post_content <> ''",
@@ -299,16 +1213,13 @@ if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
 				)
 			);
 
+			$lines[] = 'Private sermons: ' . $private_count;
+			$lines[] = 'Scheduled sermons: ' . $future_count;
 			$lines[] = 'Sermons with non-empty post_content: ' . $content_nonempty;
 
 			return $lines;
 		}
 
-		/**
-		 * SECTION: Taxonomy details
-		 *
-		 * @return array
-		 */
 		private function section_taxonomy_details() {
 			$lines   = array();
 			$lines[] = '';
@@ -320,14 +1231,15 @@ if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
 					continue;
 				}
 
-				$tax_obj      = get_taxonomy( $taxonomy );
-				$term_count   = wp_count_terms(
+				$tax_obj    = get_taxonomy( $taxonomy );
+				$term_count = wp_count_terms(
 					array(
 						'taxonomy'   => $taxonomy,
 						'hide_empty' => false,
 					)
 				);
-				$top_terms    = get_terms(
+
+				$top_terms = get_terms(
 					array(
 						'taxonomy'   => $taxonomy,
 						'hide_empty' => false,
@@ -336,23 +1248,17 @@ if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
 						'order'      => 'DESC',
 					)
 				);
-				$lines[]      = $taxonomy . ':';
-				$lines[]      = ' - label: ' . $this->clean_line( $tax_obj->label ?? '' );
-				$lines[]      = ' - public: ' . ( ! empty( $tax_obj->public ) ? 'yes' : 'no' );
-				$lines[]      = ' - hierarchical: ' . ( ! empty( $tax_obj->hierarchical ) ? 'yes' : 'no' );
-				$lines[]      = ' - rewrite slug: ' . $this->format_rewrite_slug( $tax_obj->rewrite ?? false );
-				$lines[]      = ' - total terms: ' . (int) $term_count;
-				$lines[]      = ' - top terms: ' . $this->format_terms_for_report( $top_terms );
+
+				$lines[] = $taxonomy . ':';
+				$lines[] = ' - label: ' . $this->clean_line( $tax_obj->label ?? '' );
+				$lines[] = ' - rewrite slug: ' . $this->format_rewrite_slug( $tax_obj->rewrite ?? false );
+				$lines[] = ' - total terms: ' . (int) $term_count;
+				$lines[] = ' - top terms: ' . $this->format_terms_for_report( $top_terms );
 			}
 
 			return $lines;
 		}
 
-		/**
-		 * SECTION: Meta usage
-		 *
-		 * @return array
-		 */
 		private function section_meta_usage() {
 			global $wpdb;
 
@@ -372,7 +1278,7 @@ if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
 				return $lines;
 			}
 
-			foreach ( $this->known_meta_keys as $meta_key ) {
+			foreach ( $this->report_meta_keys as $meta_key ) {
 				$used_on = (int) $wpdb->get_var(
 					$wpdb->prepare(
 						"SELECT COUNT(DISTINCT pm.post_id)
@@ -403,40 +1309,12 @@ if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
 				);
 
 				$lines[] = $meta_key . ': used on ' . $used_on . ' / ' . $total_posts . ' sermons'
-					. ( $sample !== null ? ' | sample: ' . $this->short_sample_value( $sample ) : '' );
-			}
-
-			$top_meta = $wpdb->get_results(
-				$wpdb->prepare(
-					"SELECT pm.meta_key, COUNT(*) AS qty
-					 FROM {$wpdb->postmeta} pm
-					 INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
-					 WHERE p.post_type = %s
-					 GROUP BY pm.meta_key
-					 ORDER BY qty DESC
-					 LIMIT 25",
-					'wpfc_sermon'
-				),
-				ARRAY_A
-			);
-
-			$lines[] = 'Top 25 sermon meta keys:';
-			if ( empty( $top_meta ) ) {
-				$lines[] = ' - none';
-			} else {
-				foreach ( $top_meta as $row ) {
-					$lines[] = ' - ' . $row['meta_key'] . ': ' . (int) $row['qty'];
-				}
+					. ( null !== $sample ? ' | sample: ' . $this->short_sample_value( $sample ) : '' );
 			}
 
 			return $lines;
 		}
 
-		/**
-		 * SECTION: shortcode usage in posts/pages/widgets/options.
-		 *
-		 * @return array
-		 */
 		private function section_shortcode_usage() {
 			global $wpdb;
 
@@ -445,8 +1323,9 @@ if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
 			$lines[] = '[SHORTCODE USAGE]';
 
 			foreach ( $this->known_shortcodes as $shortcode ) {
-				$pattern    = '%[' . $wpdb->esc_like( $shortcode ) . '%';
-				$post_hits  = $wpdb->get_results(
+				$pattern = '%[' . $wpdb->esc_like( $shortcode ) . '%';
+
+				$post_hits = $wpdb->get_results(
 					$wpdb->prepare(
 						"SELECT ID, post_title, post_type, post_status
 						 FROM {$wpdb->posts}
@@ -458,176 +1337,25 @@ if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
 					),
 					ARRAY_A
 				);
-				$option_hits = $wpdb->get_results(
-					$wpdb->prepare(
-						"SELECT option_name
-						 FROM {$wpdb->options}
-						 WHERE option_value LIKE %s
-						 ORDER BY option_name",
-						$pattern
-					),
-					ARRAY_A
-				);
 
 				$lines[] = '[' . $shortcode . ']';
 				$lines[] = ' - content hits: ' . count( $post_hits );
+
 				foreach ( array_slice( $post_hits, 0, 20 ) as $hit ) {
 					$lines[] = '   * ' . $hit['post_type'] . ' #' . (int) $hit['ID'] . ' [' . $hit['post_status'] . '] ' . $this->clean_line( $hit['post_title'] );
 				}
-				if ( count( $post_hits ) > 20 ) {
-					$lines[] = '   * ... ' . ( count( $post_hits ) - 20 ) . ' more';
-				}
-
-				$lines[] = ' - option/widget hits: ' . count( $option_hits );
-				foreach ( array_slice( $option_hits, 0, 20 ) as $hit ) {
-					$lines[] = '   * option: ' . $hit['option_name'];
-				}
-				if ( count( $option_hits ) > 20 ) {
-					$lines[] = '   * ... ' . ( count( $option_hits ) - 20 ) . ' more';
-				}
 			}
 
 			return $lines;
 		}
 
-		/**
-		 * SECTION: theme template overrides / sermon.css.
-		 *
-		 * @return array
-		 */
-		private function section_template_overrides() {
-			$lines   = array();
-			$lines[] = '';
-			$lines[] = '[THEME TEMPLATE OVERRIDES]';
-
-			$stylesheet_dir = get_stylesheet_directory();
-			$theme_files    = $this->get_theme_files_recursive( $stylesheet_dir );
-
-			$interesting = array(
-				'archive-wpfc_sermon.php',
-				'single-wpfc_sermon.php',
-				'taxonomy-wpfc_preacher.php',
-				'taxonomy-wpfc_sermon_series.php',
-				'taxonomy-wpfc_sermon_topics.php',
-				'taxonomy-wpfc_bible_book.php',
-				'taxonomy-wpfc_service_type.php',
-				'sermon.css',
-			);
-
-			foreach ( $interesting as $needle ) {
-				$found = false;
-				foreach ( $theme_files as $relative ) {
-					if ( basename( $relative ) === $needle ) {
-						$lines[] = 'Found theme override/file: ' . $relative;
-						$found   = true;
-					}
-				}
-				if ( ! $found ) {
-					$lines[] = 'Not found: ' . $needle;
-				}
-			}
-
-			$view_refs = array();
-			foreach ( $theme_files as $relative ) {
-				if ( stripos( $relative, 'sermon' ) !== false || stripos( $relative, 'wpfc' ) !== false ) {
-					$view_refs[] = $relative;
-				}
-			}
-
-			$lines[] = 'Other theme files with "sermon" or "wpfc" in filename:';
-			if ( empty( $view_refs ) ) {
-				$lines[] = ' - none';
-			} else {
-				foreach ( array_slice( $view_refs, 0, 50 ) as $file ) {
-					$lines[] = ' - ' . $file;
-				}
-				if ( count( $view_refs ) > 50 ) {
-					$lines[] = ' - ... ' . ( count( $view_refs ) - 50 ) . ' more';
-				}
-			}
-
-			return $lines;
-		}
-
-		/**
-		 * SECTION: theme/plugin code references to Sermon Manager internals.
-		 *
-		 * @return array
-		 */
-		private function section_theme_code_refs() {
-			$lines   = array();
-			$lines[] = '';
-			$lines[] = '[CODE REFERENCES IN THE ACTIVE THEME]';
-
-			$theme_dir = get_stylesheet_directory();
-			$files     = $this->get_theme_files_recursive( $theme_dir, array( 'php', 'css', 'js', 'html', 'txt' ) );
-
-			$needles = array(
-				'wpfc_sermon',
-				'wpfc_preacher',
-				'wpfc_sermon_series',
-				'wpfc_sermon_topics',
-				'wpfc_bible_book',
-				'wpfc_service_type',
-				'[sermons',
-				'[sermon_images',
-				'[list_podcasts',
-				'[list_sermons',
-				'[latest_series',
-				'[sermon_sort_fields',
-				'[latest_sermon',
-				'sm_',
-				'SermonManager',
-			);
-
-			$matches = array();
-
-			foreach ( $files as $relative ) {
-				$absolute = trailingslashit( $theme_dir ) . $relative;
-				$content  = @file_get_contents( $absolute ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
-
-				if ( ! is_string( $content ) || $content === '' ) {
-					continue;
-				}
-
-				$found_needles = array();
-				foreach ( $needles as $needle ) {
-					if ( strpos( $content, $needle ) !== false ) {
-						$found_needles[] = $needle;
-					}
-				}
-
-				if ( ! empty( $found_needles ) ) {
-					$matches[ $relative ] = $found_needles;
-				}
-			}
-
-			if ( empty( $matches ) ) {
-				$lines[] = 'No obvious Sermon Manager references found in active theme files.';
-				return $lines;
-			}
-
-			foreach ( $matches as $file => $found_needles ) {
-				$lines[] = $file . ' => ' . implode( ', ', $found_needles );
-			}
-
-			return $lines;
-		}
-
-		/**
-		 * SECTION: menu/permalink/archive patterns.
-		 *
-		 * @return array
-		 */
 		private function section_menu_and_permalink_usage() {
 			global $wpdb;
 
 			$lines   = array();
 			$lines[] = '';
 			$lines[] = '[MENU / URL / PERMALINK USAGE]';
-
-			$archive_link = get_post_type_archive_link( 'wpfc_sermon' );
-			$lines[]      = 'Archive link for wpfc_sermon: ' . ( $archive_link ? $archive_link : 'not available' );
+			$lines[] = 'Archive link for wpfc_sermon: ' . ( get_post_type_archive_link( 'wpfc_sermon' ) ? get_post_type_archive_link( 'wpfc_sermon' ) : 'not available' );
 
 			$menu_items = $wpdb->get_results(
 				"SELECT ID, post_title
@@ -646,9 +1374,9 @@ if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
 				}
 
 				if (
-					strpos( $url, 'post_type=wpfc_sermon' ) !== false
-					|| strpos( $url, '/sermons' ) !== false
-					|| strpos( $url, 'wpfc_sermon' ) !== false
+					false !== strpos( $url, 'post_type=wpfc_sermon' )
+					|| false !== strpos( $url, '/' . $this->get_archive_slug() )
+					|| false !== strpos( $url, 'wpfc_sermon' )
 				) {
 					$matched_menus[] = 'nav_menu_item #' . (int) $item['ID'] . ': ' . $this->clean_line( $item['post_title'] ) . ' => ' . $url;
 				}
@@ -685,11 +1413,6 @@ if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
 			return $lines;
 		}
 
-		/**
-		 * SECTION: relevant options snapshot.
-		 *
-		 * @return array
-		 */
 		private function section_options_snapshot() {
 			global $wpdb;
 
@@ -720,17 +1443,12 @@ if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
 			return $lines;
 		}
 
-		/**
-		 * SECTION: summary
-		 *
-		 * @return array
-		 */
 		private function section_summary() {
 			global $wpdb;
 
 			$lines   = array();
 			$lines[] = '';
-			$lines[] = '[SUMMARY FOR SECOND PASS]';
+			$lines[] = '[SUMMARY]';
 
 			$total_sermons = (int) $wpdb->get_var(
 				$wpdb->prepare(
@@ -739,65 +1457,46 @@ if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
 				)
 			);
 
-			$shortcode_hits = 0;
-			foreach ( $this->known_shortcodes as $shortcode ) {
-				$pattern = '%[' . $wpdb->esc_like( $shortcode ) . '%';
+			$audio_sermons = (int) $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT COUNT(DISTINCT pm.post_id)
+					 FROM {$wpdb->postmeta} pm
+					 INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+					 WHERE p.post_type = %s
+					 AND pm.meta_key = %s
+					 AND pm.meta_value <> ''",
+					'wpfc_sermon',
+					'sermon_audio'
+				)
+			);
 
-				$shortcode_hits += (int) $wpdb->get_var(
-					$wpdb->prepare(
-						"SELECT COUNT(*)
-						 FROM {$wpdb->posts}
-						 WHERE post_content LIKE %s
-						 AND post_type IN ('post','page','wp_block','wp_template','wp_template_part')
-						 AND post_status NOT IN ('trash','auto-draft')",
-						$pattern
-					)
-				);
-			}
+			$video_sermons = (int) $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT COUNT(DISTINCT pm.post_id)
+					 FROM {$wpdb->postmeta} pm
+					 INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+					 WHERE p.post_type = %s
+					 AND pm.meta_key = %s
+					 AND pm.meta_value <> ''",
+					'wpfc_sermon',
+					'sermon_video'
+				)
+			);
 
 			$lines[] = 'Total sermons detected: ' . $total_sermons;
-			$lines[] = 'Known shortcode placements detected: ' . $shortcode_hits;
-			$lines[] = 'Theme contains single/archive/template references: ' . ( $this->theme_appears_sermon_aware() ? 'yes' : 'no' );
-			$lines[] = 'Recommended next step: build compatibility layer first (CPT, taxonomies, meta boxes, archive/single support, and only the shortcodes actually detected on this site).';
+			$lines[] = 'Audio sermons detected: ' . $audio_sermons;
+			$lines[] = 'Video sermons detected: ' . $video_sermons;
+			$lines[] = 'Shortcodes implemented by Lite: [sermons], [sermon_sort_fields]';
+			$lines[] = 'Archive slug in use: ' . $this->get_archive_slug();
 
 			return $lines;
 		}
 
-		/**
-		 * Locate the Sermon Manager plugin entry.
-		 *
-		 * @param array $plugins Plugins array from get_plugins().
-		 * @return string
-		 */
-		private function find_sermon_manager_plugin_file( $plugins ) {
-			foreach ( $plugins as $plugin_file => $plugin_data ) {
-				$name = strtolower( (string) ( $plugin_data['Name'] ?? '' ) );
-				$text = strtolower( (string) ( $plugin_data['TextDomain'] ?? '' ) );
-
-				if (
-					strpos( $plugin_file, 'sermon-manager' ) !== false
-					|| strpos( $name, 'sermon manager' ) !== false
-					|| strpos( $text, 'sermon-manager' ) !== false
-				) {
-					return $plugin_file;
-				}
-			}
-
-			return '';
-		}
-
-		/**
-		 * @return string
-		 */
 		private function get_theme_label() {
 			$theme = wp_get_theme();
 			return $theme->get( 'Name' ) . ' (' . $theme->get_stylesheet() . ')';
 		}
 
-		/**
-		 * @param mixed $rewrite
-		 * @return string
-		 */
 		private function format_rewrite_slug( $rewrite ) {
 			if ( empty( $rewrite ) || ! is_array( $rewrite ) ) {
 				return 'none';
@@ -806,10 +1505,6 @@ if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
 			return isset( $rewrite['slug'] ) ? (string) $rewrite['slug'] : 'default';
 		}
 
-		/**
-		 * @param array|WP_Error $terms
-		 * @return string
-		 */
 		private function format_terms_for_report( $terms ) {
 			if ( is_wp_error( $terms ) || empty( $terms ) ) {
 				return 'none';
@@ -824,63 +1519,12 @@ if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
 			return implode( ', ', $parts );
 		}
 
-		/**
-		 * @param string $base_dir
-		 * @param string[] $extensions
-		 * @return string[]
-		 */
-		private function get_theme_files_recursive( $base_dir, $extensions = array() ) {
-			$results = array();
-
-			if ( ! is_dir( $base_dir ) ) {
-				return $results;
-			}
-
-			$iterator = new RecursiveIteratorIterator(
-				new RecursiveDirectoryIterator(
-					$base_dir,
-					FilesystemIterator::SKIP_DOTS
-				)
-			);
-
-			$base_dir = wp_normalize_path( $base_dir );
-
-			foreach ( $iterator as $file_info ) {
-				if ( ! $file_info->isFile() ) {
-					continue;
-				}
-
-				$path = wp_normalize_path( $file_info->getPathname() );
-				$ext  = strtolower( pathinfo( $path, PATHINFO_EXTENSION ) );
-
-				if ( ! empty( $extensions ) && ! in_array( $ext, $extensions, true ) ) {
-					continue;
-				}
-
-				$relative   = ltrim( str_replace( $base_dir, '', $path ), '/' );
-				$results[]  = $relative;
-			}
-
-			sort( $results );
-
-			return $results;
-		}
-
-		/**
-		 * @param string $value
-		 * @return string
-		 */
 		private function clean_line( $value ) {
 			$value = wp_strip_all_tags( (string) $value );
 			$value = preg_replace( '/\s+/', ' ', $value );
 			return trim( $value );
 		}
 
-		/**
-		 * @param mixed $value
-		 * @param int   $limit
-		 * @return string
-		 */
 		private function short_sample_value( $value, $limit = 90 ) {
 			if ( is_array( $value ) || is_object( $value ) ) {
 				$value = wp_json_encode( $value );
@@ -894,29 +1538,7 @@ if ( ! class_exists( 'SMLA_Audit_Plugin' ) ) {
 
 			return $value;
 		}
-
-		/**
-		 * @return bool
-		 */
-		private function theme_appears_sermon_aware() {
-			$theme_dir = get_stylesheet_directory();
-			$files     = $this->get_theme_files_recursive( $theme_dir, array( 'php', 'css', 'js', 'html', 'txt' ) );
-
-			foreach ( $files as $relative ) {
-				if (
-					basename( $relative ) === 'archive-wpfc_sermon.php'
-					|| basename( $relative ) === 'single-wpfc_sermon.php'
-					|| basename( $relative ) === 'sermon.css'
-					|| stripos( $relative, 'sermon' ) !== false
-					|| stripos( $relative, 'wpfc' ) !== false
-				) {
-					return true;
-				}
-			}
-
-			return false;
-		}
 	}
 
-	new SMLA_Audit_Plugin();
+	new SML_Plugin();
 }
