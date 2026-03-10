@@ -3,7 +3,7 @@
  * Plugin Name: Sermon Manager Lite
  * Plugin URI: https://stronganchortech.com
  * Description: Lightweight wpfc-compatible replacement for Sermon Manager for WordPress. Preserves legacy sermon data, URLs, core front-end output, and essential shortcodes.
- * Version: 0.1.2
+ * Version: 0.1.3
  * Author: Strong Anchor Tech
  * Author URI: https://stronganchortech.com
  * License: GPLv2 or later
@@ -105,6 +105,11 @@ if ( ! class_exists( 'SML_Plugin' ) ) {
 		 */
 		private $legacy_plugin_active = false;
 
+		/**
+		 * @var bool
+		 */
+		private $archive_filters_rendered = false;
+
 		public function __construct() {
 			$this->legacy_plugin_active = $this->is_legacy_plugin_active();
 
@@ -120,6 +125,8 @@ if ( ! class_exists( 'SML_Plugin' ) ) {
 			add_action( 'save_post_wpfc_sermon', array( $this, 'save_sermon_meta' ) );
 
 			add_action( 'pre_get_posts', array( $this, 'adjust_sermon_queries' ) );
+			add_action( 'loop_start', array( $this, 'maybe_render_archive_filters' ) );
+			add_action( 'loop_no_results', array( $this, 'maybe_render_archive_filters' ) );
 			add_filter( 'the_content', array( $this, 'filter_sermon_content' ), 20 );
 
 			add_action( 'wp_enqueue_scripts', array( $this, 'enqueue_frontend_styles' ) );
@@ -444,31 +451,41 @@ if ( ! class_exists( 'SML_Plugin' ) ) {
 
 			$query->set( 'post_type', 'wpfc_sermon' );
 			$query->set( 'posts_per_page', $this->get_sermon_count() );
-
-			switch ( $sort ) {
-				case 'title_asc':
-					$query->set( 'orderby', 'title' );
-					$query->set( 'order', 'ASC' );
-					break;
-
-				case 'title_desc':
-					$query->set( 'orderby', 'title' );
-					$query->set( 'order', 'DESC' );
-					break;
-
-				case 'oldest':
-					$query->set( 'meta_key', 'sermon_date' );
-					$query->set( 'orderby', 'meta_value_num' );
-					$query->set( 'order', 'ASC' );
-					break;
-
-				case 'newest':
-				default:
-					$query->set( 'meta_key', 'sermon_date' );
-					$query->set( 'orderby', 'meta_value_num' );
-					$query->set( 'order', 'DESC' );
-					break;
+			foreach ( $this->get_sermon_sort_args( $sort ) as $key => $value ) {
+				$query->set( $key, $value );
 			}
+
+			$tax_query = $this->merge_tax_queries(
+				$query->get( 'tax_query' ),
+				$this->get_requested_sermon_tax_query()
+			);
+
+			if ( ! empty( $tax_query ) ) {
+				$query->set( 'tax_query', $tax_query );
+			}
+		}
+
+		public function maybe_render_archive_filters( $query ) {
+			if ( is_admin() || $this->archive_filters_rendered ) {
+				return;
+			}
+
+			if ( ! ( $query instanceof WP_Query ) || ! $query->is_main_query() ) {
+				return;
+			}
+
+			if ( ! $query->is_post_type_archive( 'wpfc_sermon' ) ) {
+				return;
+			}
+
+			$markup = $this->get_archive_filters_markup();
+			if ( '' === $markup ) {
+				return;
+			}
+
+			$this->archive_filters_rendered = true;
+
+			echo $markup; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 		}
 
 		public function filter_sermon_content( $content ) {
@@ -664,6 +681,10 @@ if ( ! class_exists( 'SML_Plugin' ) ) {
 			.sml-sermon-card-meta{margin:0 0 .55rem;color:#666;font-size:.95rem}
 			.sml-sermon-card-tax{margin:.5rem 0}
 			.sml-sermon-tax-chip{display:inline-block;margin:0 .35rem .35rem 0;padding:.2rem .5rem;border-radius:999px;background:#f1f1f1;font-size:.85rem}
+			.sml-sermon-filter-form{display:flex;flex-wrap:wrap;gap:.75rem;align-items:center;margin:0 0 1.5rem}
+			.sml-sermon-filter-field{min-width:180px;flex:1 1 180px}
+			.sml-sermon-filter-field select{width:100%;padding:.45rem .6rem}
+			.sml-sermon-filter-reset{display:inline-flex;align-items:center;padding:.45rem .75rem;border:1px solid #ccc;border-radius:6px;text-decoration:none;white-space:nowrap}
 			.sml-sermon-sort-form{display:flex;gap:.75rem;align-items:end;flex-wrap:wrap;margin:0 0 1rem}
 			.sml-sermon-sort-form label{display:flex;flex-direction:column;font-weight:600}
 			.sml-sermon-sort-form select,.sml-sermon-sort-form button{padding:.45rem .6rem}
@@ -746,63 +767,11 @@ if ( ! class_exists( 'SML_Plugin' ) ) {
 				'posts_per_page' => (int) $atts['posts_per_page'],
 				'paged'          => $paged,
 			);
+			$args = array_merge( $args, $this->get_sermon_sort_args( $sort ) );
 
-			switch ( $sort ) {
-				case 'title_asc':
-					$args['orderby'] = 'title';
-					$args['order']   = 'ASC';
-					break;
-
-				case 'title_desc':
-					$args['orderby'] = 'title';
-					$args['order']   = 'DESC';
-					break;
-
-				case 'oldest':
-					$args['meta_key'] = 'sermon_date';
-					$args['orderby']  = 'meta_value_num';
-					$args['order']    = 'ASC';
-					break;
-
-				case 'newest':
-				default:
-					$args['meta_key'] = 'sermon_date';
-					$args['orderby']  = 'meta_value_num';
-					$args['order']    = 'DESC';
-					break;
-			}
-
-			$tax_query = array();
-
-			$map = array(
-				'preacher'     => 'wpfc_preacher',
-				'series'       => 'wpfc_sermon_series',
-				'topic'        => 'wpfc_sermon_topics',
-				'book'         => 'wpfc_bible_book',
-				'service_type' => 'wpfc_service_type',
-			);
-
-			foreach ( $map as $att_key => $taxonomy ) {
-				$value = '';
-				if ( isset( $_GET[ $att_key ] ) ) {
-					$value = sanitize_title( wp_unslash( $_GET[ $att_key ] ) );
-				} elseif ( '' !== $atts[ $att_key ] ) {
-					$value = sanitize_title( $atts[ $att_key ] );
-				}
-
-				if ( '' !== $value ) {
-					$tax_query[] = array(
-						'taxonomy' => $taxonomy,
-						'field'    => 'slug',
-						'terms'    => $value,
-					);
-				}
-			}
+			$tax_query = $this->get_requested_sermon_tax_query( $atts );
 
 			if ( ! empty( $tax_query ) ) {
-				if ( count( $tax_query ) > 1 ) {
-					$tax_query['relation'] = 'AND';
-				}
 				$args['tax_query'] = $tax_query;
 			}
 
@@ -894,20 +863,221 @@ if ( ! class_exists( 'SML_Plugin' ) ) {
 		private function render_preserved_query_args( $exclude = array() ) {
 			$output = '';
 
-			foreach ( $_GET as $key => $value ) {
-				$key = (string) $key;
-				if ( in_array( $key, $exclude, true ) ) {
-					continue;
-				}
-
-				if ( is_array( $value ) ) {
-					continue;
-				}
-
-				$output .= '<input type="hidden" name="' . esc_attr( $key ) . '" value="' . esc_attr( sanitize_text_field( wp_unslash( $value ) ) ) . '" />';
+			foreach ( $this->get_preserved_query_args( $exclude ) as $key => $value ) {
+				$output .= '<input type="hidden" name="' . esc_attr( $key ) . '" value="' . esc_attr( $value ) . '" />';
 			}
 
 			return $output;
+		}
+
+		private function get_archive_filters_markup() {
+			$archive_link = get_post_type_archive_link( 'wpfc_sermon' );
+			if ( ! $archive_link ) {
+				return '';
+			}
+
+			$filters         = $this->get_sermon_filter_map();
+			$current_filters = $this->get_requested_sermon_filters();
+			$exclude_keys    = array_merge( array_keys( $filters ), array( 'paged' ) );
+			$fields          = array();
+
+			foreach ( $filters as $key => $config ) {
+				$terms = $this->get_taxonomy_filter_terms( $config['taxonomy'] );
+
+				if ( empty( $terms ) && '' === $current_filters[ $key ] ) {
+					continue;
+				}
+
+				$field_id = 'sml-sermon-filter-' . $key;
+				$options  = '<option value="">' . esc_html( $config['label'] ) . '</option>';
+
+				foreach ( $terms as $term ) {
+					$options .= '<option value="' . esc_attr( $term->slug ) . '"' . selected( $current_filters[ $key ], $term->slug, false ) . '>' . esc_html( $term->name ) . '</option>';
+				}
+
+				$fields[] = '<label class="sml-sermon-filter-field" for="' . esc_attr( $field_id ) . '"><span class="screen-reader-text">' . esc_html( $config['label'] ) . '</span><select id="' . esc_attr( $field_id ) . '" name="' . esc_attr( $key ) . '" onchange="this.form.submit()">' . $options . '</select></label>';
+			}
+
+			if ( empty( $fields ) ) {
+				return '';
+			}
+
+			$reset_url = add_query_arg(
+				$this->get_preserved_query_args( $exclude_keys ),
+				$archive_link
+			);
+
+			ob_start();
+			?>
+			<form method="get" action="<?php echo esc_url( $archive_link ); ?>" class="sml-sermon-filter-form" aria-label="<?php esc_attr_e( 'Filter sermons', 'sermon-manager-lite' ); ?>">
+				<?php echo implode( '', $fields ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped ?>
+				<?php echo $this->render_preserved_query_args( $exclude_keys ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped ?>
+				<noscript>
+					<button type="submit"><?php esc_html_e( 'Apply Filters', 'sermon-manager-lite' ); ?></button>
+				</noscript>
+				<?php if ( $this->has_active_sermon_filters( $current_filters ) ) : ?>
+					<a class="sml-sermon-filter-reset" href="<?php echo esc_url( $reset_url ); ?>"><?php esc_html_e( 'Reset Filters', 'sermon-manager-lite' ); ?></a>
+				<?php endif; ?>
+			</form>
+			<?php
+
+			return ob_get_clean();
+		}
+
+		private function get_sermon_filter_map() {
+			return array(
+				'preacher' => array(
+					'taxonomy' => 'wpfc_preacher',
+					'label'    => __( 'Preacher', 'sermon-manager-lite' ),
+				),
+				'series' => array(
+					'taxonomy' => 'wpfc_sermon_series',
+					'label'    => __( 'Series', 'sermon-manager-lite' ),
+				),
+				'topic' => array(
+					'taxonomy' => 'wpfc_sermon_topics',
+					'label'    => __( 'Topic', 'sermon-manager-lite' ),
+				),
+				'book' => array(
+					'taxonomy' => 'wpfc_bible_book',
+					'label'    => __( 'Book', 'sermon-manager-lite' ),
+				),
+				'service_type' => array(
+					'taxonomy' => 'wpfc_service_type',
+					'label'    => __( 'Service Type', 'sermon-manager-lite' ),
+				),
+			);
+		}
+
+		private function get_requested_sermon_filters( $defaults = array() ) {
+			$filters = array();
+
+			foreach ( $this->get_sermon_filter_map() as $key => $config ) {
+				$value = '';
+
+				if ( isset( $_GET[ $key ] ) && ! is_array( $_GET[ $key ] ) ) {
+					$value = sanitize_title( wp_unslash( $_GET[ $key ] ) );
+				} elseif ( isset( $defaults[ $key ] ) && '' !== (string) $defaults[ $key ] ) {
+					$value = sanitize_title( (string) $defaults[ $key ] );
+				}
+
+				$filters[ $key ] = $value;
+			}
+
+			return $filters;
+		}
+
+		private function get_requested_sermon_tax_query( $defaults = array() ) {
+			$tax_query = array();
+			$filters   = $this->get_requested_sermon_filters( $defaults );
+
+			foreach ( $this->get_sermon_filter_map() as $key => $config ) {
+				if ( '' === $filters[ $key ] ) {
+					continue;
+				}
+
+				$tax_query[] = array(
+					'taxonomy' => $config['taxonomy'],
+					'field'    => 'slug',
+					'terms'    => $filters[ $key ],
+				);
+			}
+
+			if ( count( $tax_query ) > 1 ) {
+				$tax_query['relation'] = 'AND';
+			}
+
+			return $tax_query;
+		}
+
+		private function merge_tax_queries( $existing_query, $additional_query ) {
+			if ( empty( $existing_query ) ) {
+				return $additional_query;
+			}
+
+			if ( empty( $additional_query ) ) {
+				return $existing_query;
+			}
+
+			return array(
+				'relation' => 'AND',
+				$existing_query,
+				$additional_query,
+			);
+		}
+
+		private function get_sermon_sort_args( $sort ) {
+			switch ( $sort ) {
+				case 'title_asc':
+					return array(
+						'orderby' => 'title',
+						'order'   => 'ASC',
+					);
+
+				case 'title_desc':
+					return array(
+						'orderby' => 'title',
+						'order'   => 'DESC',
+					);
+
+				case 'oldest':
+					return array(
+						'meta_key' => 'sermon_date',
+						'orderby'  => 'meta_value_num',
+						'order'    => 'ASC',
+					);
+
+				case 'newest':
+				default:
+					return array(
+						'meta_key' => 'sermon_date',
+						'orderby'  => 'meta_value_num',
+						'order'    => 'DESC',
+					);
+			}
+		}
+
+		private function get_taxonomy_filter_terms( $taxonomy ) {
+			$terms = get_terms(
+				array(
+					'taxonomy'   => $taxonomy,
+					'hide_empty' => true,
+					'orderby'    => 'name',
+					'order'      => 'ASC',
+				)
+			);
+
+			if ( is_wp_error( $terms ) ) {
+				return array();
+			}
+
+			return $terms;
+		}
+
+		private function get_preserved_query_args( $exclude = array() ) {
+			$args = array();
+
+			foreach ( $_GET as $key => $value ) {
+				$key = (string) $key;
+
+				if ( in_array( $key, $exclude, true ) || is_array( $value ) ) {
+					continue;
+				}
+
+				$args[ $key ] = sanitize_text_field( wp_unslash( $value ) );
+			}
+
+			return $args;
+		}
+
+		private function has_active_sermon_filters( $filters ) {
+			foreach ( $filters as $value ) {
+				if ( '' !== (string) $value ) {
+					return true;
+				}
+			}
+
+			return false;
 		}
 
 		private function render_taxonomy_chips( $post_id ) {
