@@ -3,7 +3,7 @@
  * Plugin Name: Sermon Manager Lite
  * Plugin URI: https://stronganchortech.com
  * Description: Lightweight wpfc-compatible replacement for Sermon Manager for WordPress. Preserves legacy sermon data, URLs, core front-end output, and essential shortcodes.
- * Version: 0.1.5
+ * Version: 0.1.6
  * Update URI: https://github.com/stronganchor/sermon-manager-lite
  * Author: Strong Anchor Tech
  * Author URI: https://stronganchortech.com
